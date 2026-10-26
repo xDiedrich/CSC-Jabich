@@ -1,8 +1,9 @@
-This application requires python3.9 or newer
+## This application requires python3.9 or newer
+
 Download the "csc_analyst.py" file or copy raw to a notepad file and save as a .py 
 
 Open the application and press Y to download all the libraries as they come up 
-## Note wherever you open the file a folder named "csc_workplace" will get populated here and 
+Note wherever you open the file a folder named "csc_workplace" will get populated here and 
 all downloaded demos will go to this location if you would like them to go to a different location you can fix this with 
 ``` set DEMO_DIR D:\your\folder\here ```
 
