@@ -11,7 +11,8 @@ type home to bring up the the home menu again
 
 type 1 and type in the CSC team name NOT the org name if you don't know how to spell it or are having a hard time type 19 and select the number next to the team
 
-type home then type 2 ## this will download all the CURRENT season demos 
+type home then type 2 
+this will download all the CURRENT season demos 
 
 type 4 then hit enter and let it parse
 
