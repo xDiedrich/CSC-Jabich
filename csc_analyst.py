@@ -4648,6 +4648,7 @@ def find_font(kind):
 
 THEME_KEYS = ("bg", "card", "ink", "mut", "acc", "line", "tag_bg", "row_alt", "head")
 THEME = {}          # the active theme (filled by apply_theme)
+DEFAULT_FOOTER = "Tool by xDiedrich and Brian"
 STYLE_FILE_NAME = "report_style.json"
 STYLE_TEMPLATE = {
     "_help": "Tweaks on top of the selected theme (`style <name>`). Delete a line to use the theme's value. "
@@ -4677,7 +4678,7 @@ def load_theme(name="midnight", style_path=None):
     """Theme dict = preset + your report_style.json tweaks, with the derived colors filled in."""
     t = dict(THEMES.get((name or "midnight").lower(), THEMES["midnight"]))
     t["name"] = (name or "midnight").lower() if (name or "").lower() in THEMES else "midnight"
-    t.update(font="", font_bold="", logo="", footer="")
+    t.update(font="", font_bold="", logo="", footer=DEFAULT_FOOTER)
     if style_path and Path(style_path).exists():
         try:
             st = json.loads(Path(style_path).read_text(encoding="utf-8"))
@@ -4687,6 +4688,8 @@ def load_theme(name="midnight", style_path=None):
             for k in ("font", "font_bold", "logo", "footer"):
                 if st.get(k):
                     t[k] = str(st[k])
+            if str(st.get("footer", "")).strip().lower() in ("off", "none"):
+                t["footer"] = ""
             t["custom"] = True
         except Exception as e:
             warn(f"{STYLE_FILE_NAME} couldn't be read ({e}) - using the plain {t['name']} theme.")
@@ -5696,11 +5699,11 @@ MAIN_MENU = [
 ]
 
 BANNER = r"""
-    ___ ___  ___   _               _         _
-   / __/ __|/ __| /_\  _ _  __ _ | |_  _ __| |_
-  | (__\__ \ (__ / _ \| ' \/ _` || | || (_-<  _|
-   \___|___/\___/_/ \_\_||_\__,_||_|\_, /__/\__|
-                                    |__/   v{v}
+    ___ ___  ___        _        _     _      _    
+   / __/ __|/ __|    _ | | __ _ | |__ (_) __ | |_  
+  | (__\__ \ (__    | || |/ _` || '_ \| |/ _|| ' \ 
+   \___|___/\___|    \__/ \__,_||_.__/|_|\__||_||_|
+                                             v{v}
 """
 
 
@@ -8635,7 +8638,7 @@ class Console(cmd.Cmd):
         elif sub == "logo":
             st["logo"] = ""
         elif sub == "footer":
-            st["footer"] = " ".join(parts[1:])
+            st["footer"] = " ".join(parts[1:])  # blank = back to the default, `off` = no footer
         elif sub in ("color", "colour") and len(parts) == 3:
             key, val = parts[1].lower(), parts[2]
             alias = {"accent": "acc", "background": "bg", "text": "ink", "muted": "mut", "lines": "line", "box": "card",
