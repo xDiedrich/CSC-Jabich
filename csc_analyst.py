@@ -17,10 +17,10 @@ r"""
      linked to the MetaStack videos you save for those rounds
 
  RUN IT
-   python esea_analyst.py                     interactive console (menu + commands)
-   python esea_analyst.py -x "parse; report"  run commands and exit (scriptable)
-   python esea_analyst.py -r scout.rc         run a resource file of commands
-   python esea_analyst.py -x "show 4" --json  machine-readable output
+   python csc_analyst.py                     interactive console (menu + commands)
+   python csc_analyst.py -x "parse; report"  run commands and exit (scriptable)
+   python csc_analyst.py -r scout.rc         run a resource file of commands
+   python csc_analyst.py -x "show 4" --json  machine-readable output
 
  IN THE CONSOLE
    Type a menu number, or a command. `help` lists everything.
@@ -77,7 +77,6 @@ PARSE_VERSION = 2          # 2: positions sampled through the bomb timer (late r
 READABLE_PARSE_VERSIONS = {1, 2}  # older caches still load; `parse` upgrades them when the demo file is there
 TICKRATE = 64
 SCRIPT_DIR = Path(__file__).resolve().parent
-UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
 pd = np = plt = None  # loaded by load_core()
 
@@ -190,7 +189,7 @@ OPTION_DEFS = [
     ("HEATMAP_STYLE", "both", "density | points | both", "Output"),
     ("RADARS", "auto", "auto = download the CS2 radar images when needed | off", "Output"),
     ("CALLOUT_NAMES", "pretty", "pretty = readable/your `rename` names | raw = Valve's area names", "Output"),
-    ("PLAYER_NAMES", "faceit", "faceit = CSC names (one name per player) | ingame = in-game names", "Output"),
+    ("PLAYER_NAMES", "csc", "csc = CSC names (one name per player) | ingame = in-game names", "Output"),
     ("OPEN_FILES", "true", "Open the report automatically when it's built", "Output"),
     ("REPORT_FORMAT", "both", "both (HTML opens right away, PDF saved next to it) | html | pdf", "Output"),
     ("REPORT_HIDE_DROPPED", "true", "Leave players dropped from the CSC roster out of reports (heatmaps, tables, summaries)", "Output"),
@@ -223,9 +222,6 @@ class Config:
                 self.v.update({k.upper(): str(val) for k, val in json.loads(self.path.read_text()).items()})
             except Exception:
                 warn(f"Could not read {self.path}; using defaults.")
-        for env, key in (("FACEIT_API_KEY", "API_KEY"), ("FACEIT_DOWNLOADS_TOKEN", "DOWNLOADS_TOKEN")):
-            if not self.v.get(key) and os.environ.get(env):
-                self.v[key] = os.environ[env]
 
     def save(self):
         self.ws.mkdir(parents=True, exist_ok=True)
@@ -342,7 +338,7 @@ class Workspace:
                 tj = json.loads((self.team_dir_for(name) / "team.json").read_text())
                 (self.root / "teams.json").write_text(json.dumps([{
                     "name": name, "team_id": tj.get("team_id", ""),
-                    "url": f"https://www.faceit.com/en/teams/{tj.get('team_id', '')}", "used": ""}], indent=2))
+                    "url": name, "used": ""}], indent=2))
             except Exception:
                 pass
         self.set_team(name)
@@ -524,8 +520,8 @@ class Workspace:
                 shutil.move(str(d), dest / d.name)
 
     # manifest: one row per demo (map) of each league match
-    MANIFEST_FIELDS = ["MatchId", "Date", "Team", "Opponent", "Map", "MapIndex", "Competition", "RoomUrl",
-                       "ResourceUrl", "FileName", "TeamSteamIds", "TeamNicks", "TeamFaceitNicks"]
+    MANIFEST_FIELDS = ["MatchId", "Date", "Team", "Opponent", "Map", "MapIndex", "Competition", "MatchUrl",
+                       "ResourceUrl", "FileName", "TeamSteamIds", "TeamNicks", "TeamCscNames"]
 
     def manifest(self):
         if not self.manifest_path.exists():
@@ -548,7 +544,7 @@ class Workspace:
 
     def row_for_file(self, f: Path, man=None):
         """Which league match/map a demo file is, whatever it's called (our name, an older name of ours,
-        FACEIT's own 1-<match id>-1-<n> name, or anything containing the match id)."""
+        a file name containing the match id)."""
         man = self.manifest() if man is None else man
         stem, name = demo_stem(f), f.name
         for r in man:
@@ -648,7 +644,7 @@ class Workspace:
         return sorted(p for p in self.demos.rglob("*.dem") if p.is_file() and "_downloads" not in p.parts)
 
 
-MIN_DEMO_BYTES = int(os.environ.get("ESEA_MIN_DEMO_BYTES", 512 * 1024))
+MIN_DEMO_BYTES = int(os.environ.get("CSC_MIN_DEMO_BYTES", 512 * 1024))
 
 
 def cache_meta(cache: Path):
@@ -697,282 +693,16 @@ def open_path(path, cfg):
 
 
 # =============================================================================
-#  FACEIT API
+#  CSC league API
 # =============================================================================
-class FaceitError(Exception):
-    pass
-
-
-LEAGUE_WORDS = ("regular season", "playoffs", "playoff", "relegation", "promotion")
-
-
 def season_of(comp):
-    """ESEA season number from a FACEIT competition name: 'S58 NA Open9-10 East C - Regular Season' -> 58."""
+    """Season number from a match-list label: 'S21 Contender - Regular Season' -> 21."""
     m = re.search(r"\b(?:S|Season\s*)(\d{1,3})\b", str(comp or ""), re.I)
     return int(m.group(1)) if m else None
 
 
 def season_set(val):
     return {int(x) for x in str(val or "").split(",") if x.strip().isdigit()}
-
-
-def is_league(comp, filt):
-    """Does a FACEIT competition name look like the league? 'auto' (or 'ESEA') recognises ESEA league names,
-    e.g. 'S58 NA Open9-10 East C - Regular Season' or 'ESEA S55 Open NA'. Anything else: words separated by |,
-    any of which must appear in the name. Blank = every match."""
-    c = (comp or "").lower()
-    f = (filt or "").strip().lower()
-    if not f or f in ("all", "*", "any"):
-        return True
-    if f in ("auto", "esea", "league"):
-        if "esea" in c:
-            return True
-        if re.match(r"^\s*s\d{1,3}\b", c) and any(w in c for w in LEAGUE_WORDS + ("open", "intermediate", "main",
-                                                                                   "advanced", "challenger", "premier", "entry")):
-            return True
-        return any(w in c for w in LEAGUE_WORDS) and not any(x in c for x in ("queue", "10man", "hub", "pug"))
-    return any(w.strip() and w.strip() in c for w in f.split("|"))
-
-
-def my_faction(teams, team_id, team_name="", roster_ids=()):
-    """Which faction ('faction1'/'faction2') is the scouted team: by id, then name, then roster overlap."""
-    teams = teams or {}
-    for f in ("faction1", "faction2"):
-        if (teams.get(f) or {}).get("faction_id") == team_id:
-            return f
-    for f in ("faction1", "faction2"):
-        if team_name and (teams.get(f) or {}).get("name", "").strip().lower() == team_name.strip().lower():
-            return f
-    roster_ids = set(roster_ids or ())
-    if roster_ids:
-        ov = {f: len({p.get("player_id") for p in (teams.get(f) or {}).get("roster") or []} & roster_ids)
-              for f in ("faction1", "faction2")}
-        best = max(ov, key=ov.get)
-        if ov[best] >= 2:
-            return best
-    return None
-
-
-class Faceit:
-    BASE = "https://open.faceit.com/data/v4"
-    DL = "https://open.faceit.com/download/v2/demos/download"
-
-    def __init__(self, key, dl_token=""):
-        if not key:
-            raise FaceitError("API_KEY is not set. Get a free server-side key at developers.faceit.com, "
-                              "then: set API_KEY <key>")
-        self.key, self.dl_token = key, dl_token
-
-    def _req(self, url, data=None, token=None):
-        headers = {"Authorization": f"Bearer {token or self.key}", "Accept": "application/json"}
-        if data is not None:
-            headers["Content-Type"] = "application/json"
-            data = json.dumps(data).encode()
-        for attempt in range(5):
-            req = urllib.request.Request(url, data=data, headers=headers)
-            try:
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    return json.load(r)
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    time.sleep(4 * (attempt + 1))
-                    continue
-                if e.code == 404:
-                    return None
-                if e.code in (401, 403):
-                    raise FaceitError(f"FACEIT rejected the key/token (HTTP {e.code}) for {url.split('?')[0]}")
-                if e.code >= 500 and attempt < 3:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-                raise FaceitError(f"HTTP {e.code} from FACEIT for {url.split('?')[0]}")
-            except urllib.error.URLError as e:
-                if attempt < 2:
-                    time.sleep(2)
-                    continue
-                raise FaceitError(f"Network error: {e.reason}")
-        raise FaceitError("FACEIT kept rate-limiting; try again in a minute.")
-
-    def get(self, path, **q):
-        url = self.BASE + path + ("?" + urllib.parse.urlencode(q) if q else "")
-        return self._req(url)
-
-    def resolve_team(self, url_or_name, game="cs2"):
-        m = UUID_RE.search(url_or_name or "")
-        if m:
-            team = self.get(f"/teams/{m.group(0)}")
-            if not team:
-                raise FaceitError(f"No FACEIT team with id {m.group(0)}")
-            return team
-        name = (url_or_name or "").rstrip("/").split("/")[-1]
-        res = self.get("/search/teams", nickname=name, game=game, limit=20) or {}
-        items = res.get("items", [])
-        hit = next((t for t in items if t.get("name", "").lower() == name.lower()), items[0] if items else None)
-        if not hit:
-            raise FaceitError(f"No FACEIT team found for '{name}'")
-        return self.get(f"/teams/{hit['team_id']}")
-
-    def league_matches(self, team, league_filter, depth, max_matches, game="cs2", log=print, days=365, seasons=()):
-        """League matches of a team, found through its members' match histories.
-
-        FACEIT's history endpoint only returns the last month unless `from` is given, so we ask for `days` back.
-        A history entry counts as this team's when the team id matches, or failing that the team name, or 3+ of
-        the roster played on the same side."""
-        tid = team["team_id"]
-        tname = (team.get("name") or "").strip().lower()
-        roster = {m.get("user_id") for m in team.get("members", [])}
-        since = max(0, int(time.time() - days * 86400))
-        found = {}
-        self.diag = dict(scanned=0, team=0, comps=Counter(), other_comps=Counter())
-        seen = set()
-        for mem in team.get("members", []):
-            log(f"    scanning {mem.get('nickname')}'s history")
-            offset = 0
-            while offset < min(depth, 1000):
-                lim = min(100, depth - offset)
-                h = self.get(f"/players/{mem['user_id']}/history", game=game, offset=offset, limit=lim,
-                             **{"from": since, "to": int(time.time())}) or {}
-                items = h.get("items", [])
-                for it in items:
-                    mid = it.get("match_id")
-                    if not mid or mid in seen:
-                        continue
-                    seen.add(mid)
-                    self.diag["scanned"] += 1
-                    comp = it.get("competition_name") or ""
-                    if not self._is_team_match(it, tid, tname, roster):
-                        self.diag["other_comps"][comp] += 1
-                        continue
-                    self.diag["team"] += 1
-                    self.diag["comps"][comp] += 1
-                    if not is_league(comp, league_filter):
-                        continue
-                    if seasons and season_of(comp) not in seasons:
-                        continue
-                    found[mid] = it
-                if len(items) < lim:
-                    break
-                offset += lim
-        ms = sorted(found.values(), key=lambda x: x.get("started_at") or 0, reverse=True)
-        return ms[:max_matches]
-
-    @staticmethod
-    def _is_team_match(it, tid, tname, roster):
-        tms = it.get("teams", {}) or {}
-        for f in ("faction1", "faction2"):
-            t = tms.get(f) or {}
-            if t.get("team_id") == tid or t.get("faction_id") == tid:
-                return True
-            if tname and (t.get("nickname") or t.get("name") or "").strip().lower() == tname:
-                return True
-            players = {p.get("player_id") for p in t.get("players") or []}
-            if len(players & roster) >= 3:
-                return True
-        return False
-
-    def manifest_rows(self, match_id, team_id, team_name, game="cs2", roster_ids=()):
-        m = self.get(f"/matches/{match_id}")
-        if not m:
-            return [], "match not found"
-        demos = m.get("demo_url") or []
-        if isinstance(demos, str):
-            demos = [demos]
-        if not demos:
-            return [], "no demo listed (unfinished, forfeited or expired)"
-        maps = []
-        st = self.get(f"/matches/{match_id}/stats")
-        if st and st.get("rounds"):
-            rs = sorted(st["rounds"], key=lambda r: int(r.get("match_round") or 0))
-            maps = [(r.get("round_stats") or {}).get("Map") for r in rs]
-        if not any(maps):
-            maps = ((m.get("voting") or {}).get("map") or {}).get("pick") or []
-        teams = m.get("teams") or {}
-        fac = my_faction(teams, team_id, team_name, roster_ids)
-        mine = teams.get(fac) if fac else None
-        opp = (teams.get("faction2" if fac == "faction1" else "faction1") or {}) if fac else {}
-        roster = (mine or {}).get("roster") or []
-        roster = [p for p in roster if p.get("game_player_id")]
-        sids = [str(p.get("game_player_id")) for p in roster]
-        nicks = [p.get("game_player_name") or p.get("nickname") or "" for p in roster]
-        fnicks = [p.get("nickname") or "" for p in roster]
-        started = m.get("started_at") or m.get("configured_at") or 0
-        date = datetime.fromtimestamp(int(started)).strftime("%Y-%m-%d") if started else ""
-        rows = []
-        for i, url in enumerate(demos):
-            mp = maps[i] if i < len(maps) and maps[i] else "unknown_map"
-            ext = ".dem.zst" if url.endswith(".zst") else ".dem.gz" if url.endswith(".gz") else ".dem"
-            suffix = f"_m{i + 1}" if len(demos) > 1 else ""
-            oname = (opp or {}).get("name", "Unknown")
-            rows.append(dict(
-                MatchId=match_id, Date=date, Team=team_name, Opponent=oname, Map=mp, MapIndex=str(i + 1),
-                Competition=m.get("competition_name", ""), RoomUrl=f"https://www.faceit.com/en/{game}/room/{match_id}",
-                ResourceUrl=url, FileName=safe_name(f"{date}_vs_{oname}_{mp}{suffix}_{match_id.split('-')[-1][:6]}") + ext,
-                TeamSteamIds=";".join(sids), TeamNicks=";".join(nicks), TeamFaceitNicks=";".join(fnicks)))
-        return rows, ""
-
-    def steam_id(self, user_id, game="cs2"):
-        """A FACEIT player's SteamID64 (from their FACEIT profile)."""
-        if not user_id:
-            return ""
-        try:
-            p = self.get(f"/players/{user_id}") or {}
-        except Exception:  # profile lookup is a nice-to-have; never block on it
-            return ""
-        g = (p.get("games") or {}).get(game) or {}
-        return str(g.get("game_player_id") or p.get("steam_id_64") or "")
-
-    SITE = "https://api.faceit.com"
-
-    def site_json(self, path):
-        """FACEIT's own site API (no key). Used for the veto history, which the Data API doesn't expose."""
-        req = urllib.request.Request(self.SITE + path, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) esea-analyst", "Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                return json.load(r)
-        except Exception:
-            return None
-
-    def veto(self, match_id, team_id, team_name="", roster_ids=()):
-        """Veto record for one match, from the scouted team's point of view."""
-        m = self.get(f"/matches/{match_id}") or {}
-        teams = m.get("teams") or {}
-        mine = my_faction(teams, team_id, team_name, roster_ids)
-        opp = (teams.get("faction2" if mine == "faction1" else "faction1") or {}).get("name", "?") if mine else "?"
-        vm = ((m.get("voting") or {}).get("map") or {})
-        pool = [e.get("game_map_id") or e.get("class_name") or e.get("guid") for e in vm.get("entities") or []]
-        picks = vm.get("pick") or []
-        results = {}
-        # the scouted side's id in this match (may differ from team_id when matched by name or roster)
-        my_ids = {team_id, (teams.get(mine) or {}).get("faction_id")} - {None, ""} if mine else {team_id}
-        st = self.get(f"/matches/{match_id}/stats") or {}
-        for r in st.get("rounds") or []:
-            rs = r.get("round_stats") or {}
-            if rs.get("Map"):
-                results[rs["Map"]] = dict(won=rs.get("Winner") in my_ids, score=rs.get("Score", ""))
-        steps = []
-        h = self.site_json(f"/democracy/v1/match/{match_id}/history")
-        payload = (h or {}).get("payload", h) or {}
-        for t in payload.get("tickets") or []:
-            if t.get("entity_type") != "map":
-                continue
-            for e in sorted(t.get("entities") or [], key=lambda e: e.get("round") or 0):
-                by = e.get("selected_by")
-                steps.append(dict(map=e.get("guid"), action=e.get("status"), round=e.get("round"),
-                                  by="us" if by == mine else "them" if by in ("faction1", "faction2") else "?",
-                                  random=bool(e.get("random"))))
-        started = m.get("started_at") or 0
-        return dict(match_id=match_id, date=datetime.fromtimestamp(int(started)).strftime("%Y-%m-%d") if started else "",
-                    opponent=opp, best_of=m.get("best_of") or len(picks) or 1, pool=[p for p in pool if p],
-                    picks=picks, results=results, steps=steps, competition=m.get("competition_name", ""))
-
-    def signed_url(self, resource_url):
-        if not self.dl_token:
-            raise FaceitError("No DOWNLOADS_TOKEN")
-        r = self._req(self.DL, data={"resource_url": resource_url}, token=self.dl_token) or {}
-        url = (r.get("payload") or {}).get("download_url") or r.get("download_url")
-        if not url:
-            raise FaceitError("Downloads API returned no download_url")
-        return url
 
 
 class CscError(Exception):
@@ -1115,12 +845,12 @@ class Csc:
                     rows.append(dict(
                         MatchId=f"csc{m['id']}", Date=date, Team=team["name"], Opponent=oname, Map=mp, MapIndex=str(n),
                         Competition=f"S{season} {team.get('tier', '')} - {'Playoffs' if kind == 'playoff' else 'Regular Season'}",
-                        RoomUrl="", ResourceUrl=x["demoUrl"],
+                        MatchUrl="", ResourceUrl=x["demoUrl"],
                         FileName=safe_name(f"{date}_vs_{oname}_{mp}" + (f"_m{n}" if m.get("isBo3") else "") + f"_csc{m['id']}")
                         + (".dem.zip" if x["demoUrl"].lower().endswith(".zip") else ".dem"),
                         TeamSteamIds=";".join(str(p["steam64Id"]) for p in players),
                         TeamNicks=";".join(p.get("name") or "" for p in players),
-                        TeamFaceitNicks=";".join(p.get("name") or "" for p in players)))
+                        TeamCscNames=";".join(p.get("name") or "" for p in players)))
         rows.sort(key=lambda r: r["Date"], reverse=True)
         return rows
 
@@ -1788,13 +1518,14 @@ class Dataset:
         t = np.asarray(t, dtype=float)
         return np.where(t <= a, "early", np.where(t <= b, "mid", "late"))
 
-    def faceit_names(self):
-        """SteamID64 -> FACEIT nickname, from FACEIT match rosters (match list) and the team roster (team.json)."""
+    def league_names(self):
+        """SteamID64 -> CSC name, from the match list's rosters and the team roster (team.json)."""
         out = {}
         for r in self.ws.manifest():
             ids = [x for x in r.get("TeamSteamIds", "").split(";")]
-            nk = [x for x in (r.get("TeamFaceitNicks") or "").split(";")]
-            if r.get("TeamFaceitNicks") and len(ids) == len(nk):
+            names_ = r.get("TeamCscNames") or r.get("TeamNicks") or ""  # older match lists: plain name column
+            nk = [x for x in names_.split(";")]
+            if names_ and len(ids) == len(nk):
                 out.update({i: n for i, n in zip(ids, nk) if i and n})
         try:
             for m in json.loads((self.ws.team_root / "team.json").read_text()).get("members", []):
@@ -1805,15 +1536,15 @@ class Dataset:
         return out
 
     def _canonical_names(self):
-        """One name per player (keyed by SteamID): his FACEIT nickname if known, else his most-used in-game name.
+        """One name per player (keyed by SteamID): his CSC name if known, else his most-used in-game name.
         Fixes stats splitting when someone renames between matches."""
         P = self.pos
         if P is None or not len(P):
             return
         self.ingame = P.groupby("steamid")["name"].agg(lambda s: s.mode().iloc[0]).to_dict()
         canon = dict(self.ingame)
-        self.faceit = self.faceit_names() if str(self.cfg["PLAYER_NAMES"]).lower() != "ingame" else {}
-        canon.update({sid: n for sid, n in self.faceit.items() if sid in canon})
+        self.csc_names = self.league_names() if str(self.cfg["PLAYER_NAMES"]).lower() != "ingame" else {}
+        canon.update({sid: n for sid, n in self.csc_names.items() if sid in canon})
         self.canon = canon
         P["name"] = P["steamid"].map(canon).fillna(P["name"])
         if self.nades is not None and len(self.nades):
@@ -2047,7 +1778,7 @@ class Dataset:
         return set(M["demo"])
 
     def match_seasons(self):
-        """match id -> ESEA season, from the match list's competition names."""
+        """match id -> CSC season, from the match list's labels."""
         return {r["MatchId"]: season_of(r.get("Competition")) for r in self.ws.manifest()}
 
     def f(self, table, side=True, phase=True, player=True, **ov):
@@ -2129,7 +1860,7 @@ class Dataset:
         total = len(order)
         recent = set(order[-min(5, total):])
         names = P.groupby("steamid")["name"].agg(lambda s: s.mode().iloc[0])
-        sid2nick = self.faceit_names()
+        sid2nick = self.league_names()
         try:
             tm = json.loads((self.ws.team_root / "team.json").read_text())["members"]
             members = {m["nickname"].lower() for m in tm}
@@ -2263,7 +1994,7 @@ COL = {"fk": "#3ddc84", "fd": "#ff4d4d", "kill": "#3ddc84", "death": "#ff4d4d", 
        "flash": "#ffd43b", "molotov": "#ff7b29", "he": "#c77dff", "pos": "#4dabf7"}
 
 
-RADAR_REPO = os.environ.get("ESEA_RADAR_REPO", "https://github.com/pnxenopoulos/awpy-data")
+RADAR_REPO = os.environ.get("CSC_RADAR_REPO", "https://github.com/pnxenopoulos/awpy-data")
 
 
 class Radar:
@@ -2394,7 +2125,7 @@ def lower_cut_from(v):
 
 def latest_release_tag(repo_url):
     """Newest release tag; uses the /releases/latest redirect (no API rate limit), API as fallback."""
-    req = urllib.request.Request(f"{repo_url}/releases/latest", headers={"User-Agent": "esea-analyst"})
+    req = urllib.request.Request(f"{repo_url}/releases/latest", headers={"User-Agent": "csc-analyst"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             m = re.search(r"/releases/tag/([^/?#]+)", r.geturl())
@@ -2404,7 +2135,7 @@ def latest_release_tag(repo_url):
         pass
     api = repo_url.replace("https://github.com/", "https://api.github.com/repos/")
     req = urllib.request.Request(f"{api}/releases/latest",
-                                 headers={"User-Agent": "esea-analyst", "Accept": "application/vnd.github+json"})
+                                 headers={"User-Agent": "csc-analyst", "Accept": "application/vnd.github+json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)["tag_name"]
 
@@ -4065,7 +3796,7 @@ class Analyst:
             if r["rotate %"] >= 35:
                 ctr = (ctr + " / rotator").strip(" /")
             T.at[i, "CT role"] = ctr
-        # IGL: not visible in a demo -> FACEIT captain as a hint, your overrides win
+        # IGL: not visible in a demo -> CSC team captain as a hint, your overrides win
         try:
             tj = json.loads((self.ds.ws.team_root / "team.json").read_text())
             leader = tj.get("leader", "")
@@ -5354,7 +5085,7 @@ class ProLibrary:
         self.lib_path = self.root / "library.json"
         self.links_path = self.root / "metastack_links.json"
 
-    def manifest(self):  # Dataset compatibility: pro demos have no FACEIT match list
+    def manifest(self):  # Dataset compatibility: pro demos have no match list
         return []
 
     # ---- library bookkeeping -----------------------------------------------------
@@ -5794,14 +5525,14 @@ class Console(cmd.Cmd):
         except KeyboardInterrupt:
             print()
             warn("Interrupted.")
-        except (FaceitError, CscError, DemoParseError, ValueError, KeyError) as e:
+        except (CscError, DemoParseError, ValueError, KeyError) as e:
             bad(str(e).strip("'\""))
         except Exception as e:
             bad(f"{type(e).__name__}: {e}")
-            if os.environ.get("ESEA_DEBUG"):
+            if os.environ.get("CSC_DEBUG"):
                 traceback.print_exc()
             else:
-                print(C.s("    (set ESEA_DEBUG=1 for the full traceback)", "d"))
+                print(C.s("    (set CSC_DEBUG=1 for the full traceback)", "d"))
         return False
 
     def default(self, line):
@@ -6398,7 +6129,7 @@ class Console(cmd.Cmd):
                     except Exception as e:
                         bad(f"{f.name}: {e}")
                     continue
-            # series: matched only by match id, so pick the map from FACEIT's filename 1-<match>-1-<n>.dem.gz
+            # series: matched only by match id, so pick the map number from the file name (...-<n>.dem)
             if row is not None and by_match_id:
                 mi = re.search(r"-(\d+)\.dem", f.name)
                 cands = [r for r in man if r["MatchId"] == row["MatchId"]]
@@ -6431,44 +6162,6 @@ class Console(cmd.Cmd):
             except Exception as e:
                 bad(f"{f.name}: {e}")
         return n, dupes, skipped_other, keys
-
-    def missing_matches(self):
-        """League match rows with a demo on CSC that we don't have yet (respecting setmap)."""
-        idx = self.ws.have_index()
-        only = self.cfg.parse_maps()
-        rows = [r for r in self.ws.manifest() if (r["MatchId"], r["Map"]) not in idx
-                or idx[(r["MatchId"], r["Map"])][0] == "broken"]
-        if only:
-            rows = [r for r in rows if r["Map"] in only]
-        se = season_set(self.cfg["SEASON"])
-        if se:
-            rows = [r for r in rows if season_of(r.get("Competition")) in se]
-        return rows
-
-    def open_rooms(self, limit=0):
-        import webbrowser
-        rows = self.missing_matches()
-        rooms = list(dict.fromkeys(r["RoomUrl"] for r in rows))
-        if not rooms:
-            good("You have every league demo in the match list" + (f" on {self.cfg['PARSE_MAP']}" if self.cfg.parse_maps() else "") + ".")
-            return []
-        if limit:
-            rooms = rooms[:limit]
-        elif len(rooms) > 12 and self.interactive:
-            a = self.ask(f"{len(rooms)} rooms to open. Open all, or how many? (all / number)", "all")
-            if a.isdigit():
-                rooms = rooms[:int(a)]
-        info(f"Opening {len(rooms)} match room(s) in your browser - click WATCH DEMO in each tab.")
-        for i, url in enumerate(rooms, 1):
-            r = next(x for x in rows if x["RoomUrl"] == url)
-            maps = ", ".join(x["Map"].replace("de_", "") for x in rows if x["RoomUrl"] == url)
-            print(f"   {i:>2}. {r['Date']} vs {r['Opponent']} ({maps})")
-            try:
-                webbrowser.open_new_tab(url)
-            except Exception as e:
-                bad(f"Couldn't open the browser ({e}). Link: {url}")
-            time.sleep(0.4)
-        return rooms
 
     def watch_imports(self, folder="", stop_when=0, idle_minutes=15):
         """Watch a folder and import each demo as it finishes downloading (Ctrl+C to stop)."""
@@ -6574,7 +6267,7 @@ class Console(cmd.Cmd):
                 continue
             except Exception as e:
                 bad(f"  {d.name}: {type(e).__name__}: {e}")
-                if os.environ.get("ESEA_DEBUG"):
+                if os.environ.get("CSC_DEBUG"):
                     traceback.print_exc()
                 failed += 1
                 continue
