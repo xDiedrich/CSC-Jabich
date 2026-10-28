@@ -168,6 +168,10 @@ OPTION_DEFS = [
     ("MAX_MATCHES", "60", "Max matches to pull", "Team"),
     ("CSC_API", "https://core.playcsc.com/graphql", "CSC league API (GraphQL)", "Team"),
     ("CSC_MEDIA", "https://core.playcsc.com", "Where CSC serves org logos (`logos`)", "Team"),
+    ("CSC_STATS", "https://stats.playcsc.com/graphql", "CSC stats API (season stats for `compare`)", "Team"),
+    ("ANALYTIKILL_API", "https://tonysanti.com/prx/csc-stat-api/analytikill",
+     "Analytikill extended stats (per-map ratings, weapons, hit spots, utility...) used by `compare`", "Team"),
+    ("COMPARE_DEMOS", "6", "`compare`: how many recent map demos to grab for a player on another team (0 = none)", "Team"),
     ("PLAYERS", "", "Fallback: scouted players' names/SteamID64s, comma separated", "Team"),
     ("SORT_FROM", str(Path.home() / "Downloads"), "Folder `import` pulls manually downloaded demos from", "Team"),
     ("DEMO_DIR", "", r"Where demos are stored, e.g. D:\CS\demos (blank = <workspace>\demos)", "Team"),
@@ -5426,6 +5430,7 @@ MAIN_MENU = [
     ("18", "Clear cache (parsed data / pro data / images - demos are kept)", "clearcache"),
     ("19", "All CSC teams (by tier) - pick one to scout", "teams"),
     ("20", "Report style - themes, colors, logo, footer", "style"),
+    ("21", "Compare report - player vs player + free agents by role", "compare"),
     ("0", "Exit", "exit"),
 ]
 
@@ -5646,7 +5651,7 @@ class Console(cmd.Cmd):
         groups = [
             ("Team & demos", ["team", "teams", "logos", "setmap", "matches", "download", "getdemos", "import", "parse", "movedemos", "delete", "purge", "status", "inspect", "radars"]),
             ("Explore", ["show", "search", "rounds", "spot", "callouts", "rename", "plot", "heatmap", "player", "role", "roster", "maps"]),
-            ("Analyst", ["vetos", "anomalies", "counter", "report", "style"]),
+            ("Analyst", ["vetos", "anomalies", "counter", "report", "compare", "style"]),
             ("Pro library & signature plays", ["pro", "signature"]),
             ("Options (msfconsole style)", ["options", "set", "unset", "use", "run", "back", "filters", "reset"]),
             ("Other", ["commands", "home", "export", "clearcache", "menu", "clear", "exit"]),
@@ -5982,7 +5987,8 @@ class Console(cmd.Cmd):
         return [api.latest_season()]
 
     def do_download(self, arg):
-        """download [force] - list the team's CSC matches and download every demo you don't have yet (force = re-download all)."""
+        """download [force] [limit N] - list the team's CSC matches and download every demo you don't have yet
+        (force = re-download all, limit N = only the N most recent map demos)."""
         try:
             team = self._resolve_team(quiet=False)
             api = self.csc()
@@ -5993,6 +5999,9 @@ class Console(cmd.Cmd):
         info(f"Looking up {team['name']}'s matches in season(s) {', '.join(map(str, seasons))}...")
         rows = api.manifest_rows(team, seasons, types, log=lambda x: print(C.s("    " + x, "d")))
         rows = rows[: self.cfg.int("MAX_MATCHES", 60) * 3]
+        lim = re.search(r"\blimit\s+(\d+)", arg)
+        if lim:
+            rows = rows[: int(lim.group(1))]
         if not rows:
             warn("No finished matches with a demo yet." + ("" if self.cfg["CSC_SEASONS"] else
                  " Earlier seasons: `set CSC_SEASONS all` (or e.g. 20,21) and `download` again."))
@@ -8621,11 +8630,798 @@ class Console(cmd.Cmd):
                          "FD": int(dd["opening"].sum()), "nades": int(((N["demo"] == demo) & N["tgt"] & (N["name"] == n)).sum())})
         return pd.DataFrame(rows).sort_values("date") if rows else pd.DataFrame()
 
+    # ---- compare report: player vs player + free agents by role -----------------------------
+    STAT_COLS = ("name rating ctRating TRating adr kast hs kr deaths rounds gameCount odaR odr ok ol awpR "
+                 "util utilDmg ef tradesR clutchR multiR impact")
+    COMPARE_METRICS = [  # (field, label, higher is better)
+        ("rating", "Rating", True), ("TRating", "T-side rating", True), ("ctRating", "CT-side rating", True),
+        ("adr", "ADR", True), ("kast", "KAST", True), ("kr", "Kills / round", True), ("hs", "Headshot %", True),
+        ("impact", "Impact", True), ("odaR", "Opening duels / round", None), ("odr", "Opening duel win rate", True),
+        ("awpR", "AWP kills / round", None), ("utilDmg", "Utility damage", True), ("ef", "Enemies flashed", True),
+        ("tradesR", "Trades / round", True), ("clutchR", "Clutches", True), ("multiR", "Multi-kill rounds", True),
+        ("gameCount", "Games", None), ("rounds", "Rounds", None),
+    ]
+    ROLE_GROUPS = {"AWPer": "AWPer", "Secondary AWP": "AWPer", "Entry": "Entry", "Support": "Support",
+                   "Lurker": "Rifler", "Rifler": "Rifler", "IGL": "Rifler"}
+
+    def csc_people(self, max_age_h=6):
+        """Every CSC player with type (signed / free agent ...), tier, team and MMR (cached a few hours)."""
+        path = self.ws.root / "league_people.json"
+        try:
+            if time.time() - path.stat().st_mtime < max_age_h * 3600:
+                return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        try:
+            ps = self.csc().q("{ players { name steam64Id type mmr tier { name } team { name } } }").get("players") or []
+            out = [{"name": p.get("name") or "", "steamid": str(p.get("steam64Id") or ""), "type": p.get("type") or "",
+                    "mmr": p.get("mmr"), "tier": (p.get("tier") or {}).get("name", ""),
+                    "team": (p.get("team") or {}).get("name", "")} for p in ps if p.get("name")]
+            path.write_text(json.dumps(out), encoding="utf-8")
+            return out
+        except Exception as e:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                bad(f"Couldn't load CSC's player list ({e}).")
+                return []
+
+    def season_stats(self, season, match_types, max_age_h=6):
+        """CSC season stats for every player in the given match types, merged per player (weighted by rounds)."""
+        api = Csc(self.cfg["CSC_STATS"])
+        cache_dir = self.ws.root / "stats_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        frames = []
+        for mt in match_types:
+            path = cache_dir / f"s{season}_{mt}.json"
+            rows = None
+            try:
+                if time.time() - path.stat().st_mtime < max_age_h * 3600:
+                    rows = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            if rows is None:
+                try:
+                    rows = api.q("{ tierSeasonStats(season: %d, matchType: %s) { %s } }"
+                                 % (int(season), json.dumps(mt), self.STAT_COLS)).get("tierSeasonStats") or []
+                    path.write_text(json.dumps(rows), encoding="utf-8")
+                except CscError as e:
+                    warn(f"CSC stats for {mt} games, season {season}: {e}")
+                    rows = []
+            if rows:
+                frames.append(pd.DataFrame(rows).assign(source=mt))
+        if not frames:
+            return pd.DataFrame()
+        D = pd.concat(frames, ignore_index=True)
+        for c in self.STAT_COLS.split():
+            if c != "name" and c in D:
+                D[c] = pd.to_numeric(D[c], errors="coerce")
+        D["rounds"] = D["rounds"].fillna(0)
+        totals = {"rounds", "gameCount", "deaths", "ok", "ol"}
+        out = []
+        for name, g in D.groupby(D["name"].str.lower()):
+            w = g["rounds"].clip(lower=1)
+            row = {"name": g["name"].iloc[0], "source": " + ".join(sorted(set(g["source"])))}
+            for c in self.STAT_COLS.split():
+                if c == "name" or c not in g:
+                    continue
+                vals = g[c]
+                row[c] = float(vals.sum()) if c in totals else (float((vals * w).sum() / w.sum()) if vals.notna().any() else np.nan)
+            out.append(row)
+        return pd.DataFrame(out)
+
+    @staticmethod
+    def _per_round(S, col):
+        """CSC's utility / flash stats are already rates (per game or per round), so they're compared as they are."""
+        return S[col].astype(float)
+
+    def stats_roles(self, S, min_rounds=40):
+        """Role guess from season stats alone (for players without demos): AWPer / Entry / Support / Rifler."""
+        S = S.copy()
+        S["role"] = "Rifler"
+        if not len(S):
+            return S
+        ok = S["rounds"] >= min_rounds
+        awp = S["awpR"].fillna(0)
+        S.loc[awp >= 0.22, "role"] = "AWPer"
+        rest = ok & (S["role"] == "Rifler")
+        oda = S["odaR"].fillna(0)
+        if rest.sum() >= 4:
+            S.loc[rest & (oda >= oda[rest].quantile(0.75)), "role"] = "Entry"
+            rest = ok & (S["role"] == "Rifler")
+            util = self._per_round(S, "utilDmg").fillna(0) if "utilDmg" in S else pd.Series(0, index=S.index)
+            ef = self._per_round(S, "ef").fillna(0) if "ef" in S else pd.Series(0, index=S.index)
+            score = util.rank(pct=True) + ef.rank(pct=True)
+            S.loc[rest & (score >= score[rest].quantile(0.75)) & (oda <= oda[ok].quantile(0.6)), "role"] = "Support"
+        return S
+
+    def _compare_target(self, name, people, S):
+        """Everything we know about one player: CSC profile, season stats, role (demo-based when he's in the demos)."""
+        low = name.lower()
+        p = next((x for x in people if x["name"].lower() == low), None) or \
+            next((x for x in people if low in x["name"].lower()), None)
+        real = p["name"] if p else name
+        st = S[S["name"].str.lower() == real.lower()] if len(S) else pd.DataFrame()
+        role, why = "", ""
+        in_demos = self.ds.loaded and real in self.ds.tgt_names(all_players=True)
+        if in_demos and self.ds.status_of(real) == "dropped" and p and p.get("team") and p["team"] != self.team_name:
+            in_demos = False  # he's moved on: read him from his new team's demos instead
+        if in_demos:
+            R = self.an.player_roles()
+            if len(R) and (R["player"] == real).any():
+                rr = R[R["player"] == real].iloc[0]
+                role, why = rr["role"], f"from your demos: {rr['why']}"
+        if not role and len(st):
+            role = st["role"].iloc[0]
+            why = "from CSC season stats"
+        return dict(name=real, profile=p or {}, stats=st.iloc[0].to_dict() if len(st) else {}, role=role or "Rifler",
+                    group=self.ROLE_GROUPS.get(role or "Rifler", "Rifler"), why=why, in_demos=in_demos)
+
+    @staticmethod
+    def _fmt_stat(field, v):
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return "-"
+        if field in ("kast", "hs", "odr") and v <= 1.0:
+            return f"{100 * v:.0f}%"
+        if field in ("kast", "hs"):
+            return f"{v:.0f}%"
+        if field in ("gameCount", "rounds", "ok", "ol"):
+            return f"{v:.0f}"
+        return f"{v:.2f}"
+
+    def do_compare(self, arg):
+        """compare <player> [vs] <player> [season <n>] [tier <name|all>] [pdf|html|both] | compare fa [role] [tier <name|all>]
+        - side-by-side report on two players plus a page of free agents grouped by role (AWPer, Entry, Support, Rifler)."""
+        words = shlex.split(arg) if arg.strip() else []
+        fmt = next((w.lower() for w in words if w.lower() in ("pdf", "html", "both")), "")
+        words = [w for w in words if w.lower() not in ("pdf", "html", "both")]
+        season, tier = None, None
+        for key in ("season", "tier"):
+            if key in [w.lower() for w in words]:
+                i = [w.lower() for w in words].index(key)
+                if i + 1 < len(words):
+                    val = words[i + 1]
+                    if key == "season" and val.isdigit():
+                        season = int(val)
+                    elif key == "tier":
+                        tier = val
+                    del words[i:i + 2]
+        if words and words[0].lower() in ("fa", "fas", "freeagents", "free-agents"):
+            return self.fa_list(words[1] if len(words) > 1 else "", season, tier)
+        names = [w for w in words if w.lower() != "vs"]
+        if not names and self.interactive:
+            a = self._choose_compare_player("First player", allow_fa_only=False)
+            if not a:
+                return
+            b = self._choose_compare_player(f"Compare {a} with", allow_fa_only=True)
+            names = [x for x in (a, b) if x]
+        if not names:
+            bad("compare <player> <player>   e.g. compare bravo Moses   (or: compare fa awper)")
+            return
+        if self.ds.loaded:
+            tn = self.ds.tgt_names(all_players=True)
+            names = [tn[int(n) - 1] if n.isdigit() and 0 < int(n) <= len(tn) else n for n in names]
+        return self.compare_report(names[0], names[1] if len(names) > 1 else "", season, tier, fmt)
+
+    def _choose_compare_player(self, prompt, allow_fa_only=True):
+        """Menu: pick a player from the team you scout, from any CSC team (by tier), a free agent, or type a name."""
+        mine = self.ds.tgt_names(all_players=True) if self.ds.loaded else []
+        print(C.s(f"\n  {prompt}", "bold"))
+        opts = []
+        if mine:
+            opts.append(("mine", f"A player on {self.team_name or 'the team you scout'}"))
+        opts += [("team", "A player signed on another team (pick the team)"), ("fa", "A free agent"),
+                 ("name", "Type a CSC name")]
+        if allow_fa_only:
+            opts.append(("none", "Nobody - just compare against the free agents"))
+        for i, (_, label) in enumerate(opts, 1):
+            print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {label}")
+        a = self.ask("Choose", "1")
+        kind = opts[int(a) - 1][0] if a.isdigit() and 0 < int(a) <= len(opts) else "name"
+        if kind == "none":
+            return ""
+        if kind == "name":
+            return self.ask("CSC name") or ""
+        if kind == "mine":
+            for i, n in enumerate(mine, 1):
+                print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {self.ds.label(n)}")
+            a = self.ask("Player number or name")
+            return mine[int(a) - 1] if a.isdigit() and 0 < int(a) <= len(mine) else a
+        people = self.csc_people()
+        if not people:
+            return self.ask("CSC name") or ""
+        try:
+            my_tier = json.loads((self.ws.team_root / "team.json").read_text()).get("tier", "")
+        except Exception:
+            my_tier = ""
+        if kind == "fa":
+            fas = sorted((p for p in people if p["type"] in ("FREE_AGENT", "PERMANENT_FREE_AGENT")
+                          and (not my_tier or p["tier"] == my_tier)), key=lambda p: -(p.get("mmr") or 0))
+            if not fas:
+                fas = sorted((p for p in people if p["type"] in ("FREE_AGENT", "PERMANENT_FREE_AGENT")),
+                             key=lambda p: (p["tier"], -(p.get("mmr") or 0)))
+            print(C.s(f"  Free agents{' - ' + my_tier if my_tier and any(p['tier'] == my_tier for p in fas) else ''}:", "d"))
+            for i, p in enumerate(fas, 1):
+                print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {p['name']:<20} {p['tier']:<11} MMR {p.get('mmr') or '-'}"
+                      + (C.s("  permanent FA", "d") if p["type"] == "PERMANENT_FREE_AGENT" else ""))
+            a = self.ask("Number or name")
+            return fas[int(a) - 1]["name"] if a.isdigit() and 0 < int(a) <= len(fas) else a
+        # another team: pick the tier, then the team, then the player
+        signed = [p for p in people if p["type"] == "SIGNED" and p["team"]]
+        tiers = sorted({p["tier"] for p in signed if p["tier"]},
+                       key=lambda t: ["Recruit", "Prospect", "Contender", "Challenger", "Elite", "Premier"].index(t)
+                       if t in ("Recruit", "Prospect", "Contender", "Challenger", "Elite", "Premier") else 9)
+        for i, t in enumerate(tiers, 1):
+            print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {t}" + (C.s("  (your team's tier)", "g") if t == my_tier else ""))
+        a = self.ask("Tier", str(tiers.index(my_tier) + 1) if my_tier in tiers else "1")
+        tier = tiers[int(a) - 1] if a.isdigit() and 0 < int(a) <= len(tiers) else next(
+            (t for t in tiers if t.lower().startswith(a.lower())), my_tier or (tiers[0] if tiers else ""))
+        teams = sorted({p["team"] for p in signed if p["tier"] == tier}, key=str.lower)
+        teams = [t for t in teams if t != self.team_name] or teams
+        for i, t in enumerate(teams, 1):
+            n = sum(1 for p in signed if p["team"] == t)
+            print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {t}" + C.s(f"  ({n} players)", "d"))
+        a = self.ask("Team number or name")
+        team = teams[int(a) - 1] if a.isdigit() and 0 < int(a) <= len(teams) else next(
+            (t for t in teams if a.lower() in t.lower()), "")
+        if not team:
+            bad("No such team.")
+            return ""
+        roster = sorted((p for p in signed if p["team"] == team), key=lambda p: -(p.get("mmr") or 0))
+        print(C.s(f"  {team}:", "d"))
+        for i, p in enumerate(roster, 1):
+            print(f"  {C.s('[' + str(i) + ']', 'c', 'bold')} {p['name']:<20} MMR {p.get('mmr') or '-'}")
+        a = self.ask("Player number or name")
+        return roster[int(a) - 1]["name"] if a.isdigit() and 0 < int(a) <= len(roster) else a
+
+    def _other_team_detail(self, team_name, player):
+        """Download + parse the most recent demos of another CSC team, read one player's power positions and roles
+        from them, then switch back to the team you were scouting. Returns (power positions, roles by map, maps)."""
+        n = self.cfg.int("COMPARE_DEMOS", 6)
+        if n <= 0 or not team_name:
+            return pd.DataFrame(), pd.DataFrame(), 0
+        back = self.cfg["TEAM_URL"]
+        info(f"Grabbing up to {n} recent demo(s) of {team_name} for {player}...")
+        pw = rl = pd.DataFrame()
+        maps = 0
+        saved_filters = {k: self.cfg.v[k] for k in ("MAP", "SIDE", "PHASE", "PLAYER", "OPPONENT", "LAST_N")}
+        try:
+            for k in saved_filters:
+                self.cfg.v[k] = ""
+            self.cfg.set("TEAM_URL", team_name)
+            self._resolve_team(quiet=True)
+            self.do_download(f"limit {n}")
+            self.do_parse("")
+            if self.ds.loaded and player in self.ds.tgt_names(all_players=True):
+                maps = int(self.ds.matches["demo"].nunique())
+                pw = self.an.power_positions()
+                pw = pw[pw["player"] == player] if len(pw) else pw
+                rl = self.an.roles_by_map()
+                rl = rl[rl["player"] == player] if len(rl) else rl
+            else:
+                warn(f"{player} isn't in {team_name}'s recent demos.")
+        except Exception as e:
+            warn(f"Couldn't get {team_name}'s demos: {e}")
+        finally:
+            if back:
+                self.cfg.set("TEAM_URL", back)
+                try:
+                    self._resolve_team(quiet=True)
+                except Exception:
+                    pass
+            for k, v in saved_filters.items():
+                self.cfg.v[k] = v
+        return pw, rl, maps
+
+    def extended_stats(self, season):
+        """Analytikill's extended season stats: {name(lower): record}. Falls back to the latest season that has them
+        (they're filled in after a season's games). Returns (season used, dict)."""
+        base = (self.cfg["ANALYTIKILL_API"] or "").rstrip("/")
+        if not base:
+            return None, {}
+        cache_dir = self.ws.root / "stats_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        for s_ in range(int(season), max(0, int(season) - 3), -1):
+            path = cache_dir / f"analytikill_ext_s{s_}.json"
+            rows = None
+            try:
+                age = time.time() - path.stat().st_mtime
+                if age < (6 * 3600 if s_ == int(season) else 30 * 86400):  # past seasons don't change
+                    rows = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+            if rows is None:
+                try:
+                    req = urllib.request.Request(f"{base}/extendedStats?season={s_}",
+                                                 headers={"User-Agent": "csc-analyst/" + VERSION, "Accept": "application/json"})
+                    with urllib.request.urlopen(req, timeout=40) as r:
+                        rows = json.load(r)
+                    path.write_text(json.dumps(rows), encoding="utf-8")
+                except Exception as e:
+                    warn(f"Analytikill extended stats for season {s_} unavailable ({e}).")
+                    rows = []
+            if rows:
+                return s_, {str(x.get("name", "")).lower(): x for x in rows if x.get("name")}
+        return None, {}
+
+    @staticmethod
+    def _ext_tables(names, ext):
+        """Side-by-side extended stats for 1-2 players: (summary table, per-map table)."""
+        def g(rec, *path, default=None):
+            for k in path:
+                rec = (rec or {}).get(k) if isinstance(rec, dict) else None
+            return default if rec is None else rec
+
+        def share(d, keys):
+            tot = sum(v for v in (d or {}).values() if isinstance(v, (int, float)))
+            return 100 * sum((d or {}).get(k, 0) for k in keys) / tot if tot else None
+
+        lines = [  # (label, fn(rec) -> value, format)
+            ("Pistol-round kills / T pistol", lambda r: g(r, "averages", "pistolRoundKillAverageT"), "{:.2f}"),
+            ("Pistol-round kills / CT pistol", lambda r: g(r, "averages", "pistolRoundKillAverageCt"), "{:.2f}"),
+            ("Hits to the head", lambda r: share(r.get("hitboxTags"), ["Head"]), "{:.0f}%"),
+            ("Hits to chest + stomach", lambda r: share(r.get("hitboxTags"), ["Chest", "Stomach"]), "{:.0f}%"),
+            ("Hits to legs", lambda r: share(r.get("hitboxTags"), ["LeftLeg", "RightLeg"]), "{:.0f}%"),
+            ("Kills with rifles", lambda r: share(r.get("weaponKillSubTypes"), ["rifle"]), "{:.0f}%"),
+            ("Kills with snipers", lambda r: share(r.get("weaponKillSubTypes"), ["sniper"]), "{:.0f}%"),
+            ("Kills with SMGs", lambda r: share(r.get("weaponKillSubTypes"), ["smg"]), "{:.0f}%"),
+            ("Kills with pistols", lambda r: share(r.get("weaponKillSubTypes"), ["pistol"]), "{:.0f}%"),
+            ("Top weapons", lambda r: ", ".join(f"{w} {n}" for w, n in sorted((r.get("weaponKills") or {}).items(),
+                                                                              key=lambda kv: -kv[1])[:3]) or None, "{}"),
+            ("Kills through smoke", lambda r: g(r, "trackedObj", "smokeKills"), "{:.0f}"),
+            ("Kills while flashed", lambda r: g(r, "trackedObj", "blindedKills"), "{:.0f}"),
+            ("Wallbang kills", lambda r: g(r, "trackedObj", "wallBangKills"), "{:.0f}"),
+            ("Bombs planted", lambda r: g(r, "trackedObj", "bombsPlanted"), "{:.0f}"),
+            ("Bombs defused (ninja)", lambda r: (f"{g(r, 'trackedObj', 'bombsDefused', default=0):.0f} "
+                                                 f"({g(r, 'trackedObj', 'ninjaDefuses', default=0):.0f})"), "{}"),
+            ("MVPs", lambda r: g(r, "trackedObj", "mvpCount"), "{:.0f}"),
+            ("Team kills", lambda r: g(r, "trackedObj", "teamKills"), "{:.0f}"),
+            ("Weapons bought for teammates", lambda r: (g(r, "trackedObj", "boughtPrimaryWeaponsForTeammates", default=0)
+                                                        + g(r, "trackedObj", "boughtPistolsForTeammates", default=0)), "{:.0f}"),
+            ("Avg enemy flash time (s)", lambda r: g(r, "durationAverages", "enemyFlashDurationAverage"), "{:.2f}"),
+            ("Avg team flash time (s)", lambda r: g(r, "durationAverages", "teamFlashDurationAverage"), "{:.2f}"),
+            ("Avg self flash time (s)", lambda r: g(r, "durationAverages", "selfFlashDurationAverage"), "{:.2f}"),
+            ("Crosshair code", lambda r: r.get("crosshairShareCode"), "{}"),
+        ]
+        recs = [ext.get(n.lower(), {}) for n in names]
+        rows = []
+        for label, fn, f in lines:
+            row = {"stat": label}
+            any_ = False
+            for n, rec in zip(names, recs):
+                try:
+                    v = fn(rec) if rec else None
+                except Exception:
+                    v = None
+                row[n] = "-" if v is None else f.format(v)
+                any_ |= v is not None
+            if any_:
+                rows.append(row)
+        maps = sorted({m for rec in recs for m in (rec.get("maps") or {})})
+        mrows = []
+        for m in maps:
+            row = {"map": m}
+            for n, rec in zip(names, recs):
+                d = (rec.get("maps") or {}).get(m)
+                if d:
+                    row[f"{n} W-L"] = f"{d.get('mapWins', 0)}-{d.get('mapLosses', 0)}"
+                    row[f"{n} rating"] = f"{d['hltv2Average']:.2f}" if d.get("hltv2Average") is not None else "-"
+                    row[f"{n} K-D avg"] = f"{d.get('killsAverage', 0):.1f}-{d.get('deathsAverage', 0):.1f}"
+                else:
+                    row[f"{n} W-L"] = row[f"{n} rating"] = row[f"{n} K-D avg"] = "-"
+            mrows.append(row)
+        return pd.DataFrame(rows), pd.DataFrame(mrows)
+
+    TRAIT_RULES = [  # field, strength text, weakness text, value format
+        ("rating", "One of the highest-rated players in his tier", "Low overall rating for his tier", "{:.2f}"),
+        ("adr", "Does a lot of damage", "Low damage output", "ADR {:.0f}"),
+        ("kast", "Contributes in almost every round (KAST)", "Often has rounds with no impact (low KAST)", "pct"),
+        ("kr", "Gets a lot of kills", "Few kills per round", "{:.2f}/rnd"),
+        ("hs", "High headshot rate", "Low headshot rate", "pct"),
+        ("odr", "Wins most of his opening duels", "Loses most of his opening duels", "pct"),
+        ("utilDmg", "Gets real damage out of his utility", "Little utility damage", "{:.1f}"),
+        ("ef", "Flashes enemies a lot", "Rarely flashes enemies", "{:.2f}"),
+        ("tradesR", "Trades his teammates well", "Rarely trades his teammates", "{:.2f}/rnd"),
+        ("clutchR", "Wins clutches", "Struggles in clutches", "{:.2f}"),
+        ("multiR", "Often gets multi-kill rounds", "Few multi-kill rounds", "{:.2f}"),
+        ("impact", "High impact (opening + multi kills)", "Low impact", "{:.2f}"),
+    ]
+
+    def player_traits(self, t, S, people, ext=None, tier=""):
+        """Good and bad traits: his stats ranked against players in his tier (top 20% = strength, bottom 20% =
+        weakness), plus Analytikill extras and, when he's in demos, predictability and isolation."""
+        st = t["stats"]
+        good_, bad_ = [], []
+        if st and len(S):
+            tiers = {p["name"].lower(): p["tier"] for p in people}
+            my_tier = tier or t["profile"].get("tier", "")
+            peers = S[(S["rounds"] >= 40) & (S["name"].str.lower().map(tiers) == my_tier)] if my_tier else S[S["rounds"] >= 40]
+            if len(peers) < 15:
+                peers, my_tier = S[S["rounds"] >= 40], "all tiers"
+            for field, gtxt, btxt, f in self.TRAIT_RULES:
+                v = st.get(field)
+                if v is None or v != v or field not in peers:
+                    continue
+                col = pd.to_numeric(peers[field], errors="coerce").dropna()
+                if len(col) < 10 or col.nunique() < 3:
+                    continue
+                pctl = float((col < v).mean() + 0.5 * (col == v).mean())  # ties sit in the middle
+                shown = (f"{100 * v:.0f}%" if v <= 1 else f"{v:.0f}%") if f == "pct" else f.format(v)
+                if pctl >= 0.8:
+                    good_.append((pctl, gtxt, f"{shown}, top {max(1, round(100 * (1 - pctl)))}% of {my_tier}"))
+                elif pctl <= 0.2:
+                    bad_.append((1 - pctl, btxt, f"{shown}, bottom {max(1, round(100 * pctl))}% of {my_tier}"))
+            # opening duels: how often he takes them matters with how often he wins them
+            oda, odr = st.get("odaR"), st.get("odr")
+            if oda == oda and odr == odr and oda is not None and odr is not None and "odaR" in peers:
+                oc = pd.to_numeric(peers["odaR"], errors="coerce").dropna()
+                q = float((oc < oda).mean() + 0.5 * (oc == oda).mean())
+                if q >= 0.8 and odr >= 0.5:
+                    good_.append((q, "Takes a lot of opening duels and wins them", f"{oda:.2f}/rnd, {100 * odr:.0f}% won"))
+                elif q >= 0.8 and odr < 0.45:
+                    bad_.append((q, "Takes a lot of opening duels but loses most", f"{oda:.2f}/rnd, {100 * odr:.0f}% won"))
+            if t["group"] == "AWPer" and st.get("awpR") == st.get("awpR") and st.get("awpR") is not None and "awpR" in peers:
+                aw = pd.to_numeric(peers["awpR"], errors="coerce").dropna()
+                aw = aw[aw >= 0.22]
+                if len(aw) >= 5:
+                    q = float((aw < st["awpR"]).mean())
+                    if q >= 0.7:
+                        good_.append((q, "Dangerous with the AWP", f"{st['awpR']:.2f} AWP kills/rnd, top {max(1, round(100 * (1 - q)))}% of AWPers"))
+                    elif q <= 0.3:
+                        bad_.append((1 - q, "Low AWP impact for an AWPer", f"{st['awpR']:.2f} AWP kills/rnd"))
+            tr, cr = st.get("TRating"), st.get("ctRating")
+            if tr == tr and cr == cr and tr is not None and cr is not None and abs(tr - cr) >= 0.2:
+                hi, lo = ("T", "CT") if tr > cr else ("CT", "T")
+                bad_.append((0.5, f"Much weaker on {lo} side than {hi}", f"T {tr:.2f} / CT {cr:.2f}"))
+        rec = (ext or {}).get(t["name"].lower())
+        if rec:
+            av = rec.get("averages") or {}
+            pk = (av.get("pistolRoundKillAverageT") or 0) + (av.get("pistolRoundKillAverageCt") or 0)
+            if pk >= 1.4:
+                good_.append((0.6, "Strong in pistol rounds", f"{pk / 2:.2f} kills per pistol round"))
+            elif 0 < pk <= 0.6:
+                bad_.append((0.6, "Quiet in pistol rounds", f"{pk / 2:.2f} kills per pistol round"))
+            tf = (rec.get("durationAverages") or {}).get("teamFlashDurationAverage")
+            if tf is not None and tf >= 1.5:
+                bad_.append((0.55, "Flashes his own team a lot", f"{tf:.2f} s average team-flash"))
+            tk = (rec.get("trackedObj") or {}).get("teamKills") or 0
+            if tk >= 3:
+                bad_.append((0.5, "Team kills", f"{tk} this season"))
+            maps = [(m, d.get("hltv2Average")) for m, d in (rec.get("maps") or {}).items()
+                    if d.get("hltv2Average") is not None and (d.get("mapPlayedCount") or 0) >= 2]
+            if len(maps) >= 2:
+                bm, br = max(maps, key=lambda x: x[1])
+                wm, wr = min(maps, key=lambda x: x[1])
+                if br >= 1.15:
+                    good_.append((0.45, f"Best map: {bm.replace('de_', '')}", f"rating {br:.2f}"))
+                if wr <= 0.9 and wm != bm:
+                    bad_.append((0.45, f"Weakest map: {wm.replace('de_', '')}", f"rating {wr:.2f}"))
+        if t.get("pw") is not None and len(t["pw"]):
+            locked = t["pw"][t["pw"]["% of rounds"] >= 80]
+            for _, r in locked.head(2).iterrows():
+                bad_.append((0.4, f"Predictable: {show_place(r['map'], r['power position'])} on {r['map'].replace('de_', '')} "
+                                  f"{r['half'].replace(' half', '')}", f"{r['% of rounds']:.0f}% of rounds"))
+        if t.get("traded") is not None and t["traded"] == t["traded"] and t["traded"] <= 8:
+            bad_.append((0.4, "Dies alone - rarely traded", f"{t['traded']:.0f}% of deaths traded"))
+        good_.sort(key=lambda x: -x[0])
+        bad_.sort(key=lambda x: -x[0])
+        return [g[1:] for g in good_[:6]], [b[1:] for b in bad_[:6]]
+
+    def _compare_data(self, season):
+        try:
+            season = season or Csc(self.cfg["CSC_API"]).latest_season()
+        except CscError as e:
+            bad(str(e))
+            return None
+        league = self.season_stats(season, ("Regulation", "Playoff"))
+        fa_games = self.season_stats(season, ("Combine", "FAColo"))
+        people = self.csc_people()
+        # one stats row per player: league games if he has 40+ rounds there, else his combine / FA games
+        rows = []
+        names = set(league["name"].str.lower()) if len(league) else set()
+        if len(league):
+            rows.append(league[league["rounds"] >= 40])
+        if len(fa_games):
+            have = set(rows[0]["name"].str.lower()) if rows else set()
+            rows.append(fa_games[~fa_games["name"].str.lower().isin(have)])
+        S = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+        if len(league):
+            S = pd.concat([S, league[~league["name"].str.lower().isin(set(S["name"].str.lower()))]], ignore_index=True)
+        S = self.stats_roles(S) if len(S) else S
+        return season, S, people
+
+    @staticmethod
+    def _best_map(rec, min_maps=2):
+        """'de_mirage 1.24' - his highest-rated map with at least `min_maps` played (Analytikill extended stats)."""
+        maps = [(m, d.get("hltv2Average")) for m, d in ((rec or {}).get("maps") or {}).items()
+                if d.get("hltv2Average") is not None and (d.get("mapPlayedCount") or 0) >= min_maps]
+        if not maps:
+            return ""
+        m, r = max(maps, key=lambda x: x[1])
+        return f"{m.replace('de_', '')} {r:.2f}"
+
+    def fa_table(self, S, people, tier, ref=None, ext=None):
+        """Free agents (incl. permanent FAs) in a tier with their stats and role group."""
+        fas = [p for p in people if p["type"] in ("FREE_AGENT", "PERMANENT_FREE_AGENT")]
+        if tier and tier.lower() != "all":
+            fas = [p for p in fas if p["tier"].lower() == tier.lower()]
+        if not fas:
+            return pd.DataFrame()
+        by = {n.lower(): r for n, r in zip(S["name"], S.to_dict("records"))} if len(S) else {}
+        rows = []
+        for p in fas:
+            st = by.get(p["name"].lower(), {})
+            role = st.get("role", "")
+            rows.append({"player": p["name"], "tier": p["tier"], "MMR": p.get("mmr"),
+                         "type": "permanent FA" if p["type"] == "PERMANENT_FREE_AGENT" else "FA",
+                         "role": self.ROLE_GROUPS.get(role, role) if role else "no stats",
+                         "rating": st.get("rating"), "ADR": st.get("adr"), "KAST": st.get("kast"),
+                         "opening duels/rnd": st.get("odaR"), "AWP kills/rnd": st.get("awpR"),
+                         "games": st.get("gameCount"), "stats from": st.get("source", ""),
+                         "best map (Analytikill)": self._best_map((ext or {}).get(p["name"].lower()))})
+        T = pd.DataFrame(rows)
+        if ref is not None and ref.get("rating") == ref.get("rating") and ref.get("rating") is not None:
+            T["rating vs " + ref["name"]] = (T["rating"] - ref["rating"]).round(2)
+        for c in ("rating", "ADR", "KAST", "opening duels/rnd", "AWP kills/rnd"):
+            T[c] = pd.to_numeric(T[c], errors="coerce")
+        if T["KAST"].max(skipna=True) <= 1.0:
+            T["KAST"] = (100 * T["KAST"]).round(0)
+        T = T.sort_values(["rating", "MMR"], ascending=False, na_position="last").reset_index(drop=True)
+        fmt_ = {"rating": "{:.2f}", "ADR": "{:.1f}", "KAST": "{:.0f}%", "opening duels/rnd": "{:.2f}",
+                "AWP kills/rnd": "{:.2f}", "games": "{:.0f}", "MMR": "{:.0f}"}
+        for c, f in fmt_.items():
+            if c in T:
+                T[c] = [f.format(v) if v is not None and v == v else "-" for v in pd.to_numeric(T[c], errors="coerce")]
+        for c in [c for c in T.columns if c.startswith("rating vs ")]:
+            T[c] = [f"{v:+.2f}" if v == v else "-" for v in pd.to_numeric(T[c], errors="coerce")]
+        return T
+
+    def fa_list(self, role="", season=None, tier=None):
+        got = self._compare_data(season)
+        if not got:
+            return
+        season, S, people = got
+        if tier is None:
+            try:
+                tier = json.loads((self.ws.team_root / "team.json").read_text()).get("tier", "") or "all"
+            except Exception:
+                tier = "all"
+        T = self.fa_table(S, people, tier, ext=self.extended_stats(season)[1])
+        if not len(T):
+            warn(f"No free agents in {tier}.")
+            return
+        want = {"awp": "AWPer", "awper": "AWPer", "entry": "Entry", "support": "Support", "rifler": "Rifler",
+                "lurker": "Rifler"}.get(role.lower(), "") if role else ""
+        if want:
+            T = T[T["role"] == want]
+        self.print_table(T, f"Free agents - {tier} - season {season}" + (f" - {want}s" if want else ""), rows=200)
+        print(C.s("  role = guessed from CSC season stats (AWP kills, opening duels, utility). `compare <player> <player>` "
+                  "builds the full report.", "d"))
+
+    def compare_report(self, a_name, b_name="", season=None, tier=None, fmt=""):
+        self.use_theme()
+        fmt = report_fmt(fmt or self.cfg["REPORT_FORMAT"])
+        got = self._compare_data(season)
+        if not got:
+            return
+        season, S, people = got
+        A = self._compare_target(a_name, people, S)
+        B = self._compare_target(b_name, people, S) if b_name else None
+        if not A["stats"] and not A["in_demos"]:
+            bad(f"No CSC stats or demo data for '{a_name}' in season {season}.")
+            return
+        if tier is None:
+            tier = A["profile"].get("tier") or "all"
+        other = {}
+        for t in [A] + ([B] if B else []):
+            tm = t["profile"].get("team", "")
+            if not t["in_demos"] and t["profile"].get("type") == "SIGNED" and tm and tm != self.team_name:
+                other[t["name"]] = (tm,) + self._other_team_detail(tm, t["name"])
+                rl_ = other[t["name"]][2]
+                if len(rl_):  # demo-based role beats the stats guess
+                    t["role"] = rl_["role"].mode().iloc[0]
+                    t["group"] = self.ROLE_GROUPS.get(t["role"], "Rifler")
+                    t["why"] = f"from {tm}'s demos: " + rl_[rl_["role"] == t["role"]]["why"].iloc[0]
+        info(f"Building compare report: {A['name']}" + (f" vs {B['name']}" if B else "") + f" (season {season})...")
+        sub = f"season {season}  |  generated {datetime.now():%Y-%m-%d %H:%M}"
+        title = f"{A['name']} vs {B['name']} - player comparison" if B else f"{A['name']} - free agent comparison"
+
+        def who(t):
+            p = t["profile"]
+            bits = [p.get("team") or ("free agent" if "FREE" in p.get("type", "") else p.get("type", "").lower() or "?"),
+                    p.get("tier") or "", f"MMR {p['mmr']}" if p.get("mmr") is not None else ""]
+            return "  |  ".join(b for b in bits if b)
+
+        # ---- page: head to head
+        hh = [("title", "Head to head", sub)]
+        people_ = [A] + ([B] if B else [])
+        hh += [("h2", "Players"), ("bullets", [([t["role"]], f"{t['name']}: {who(t)}",
+                                                (t["why"] + (f"; stats from {t['stats'].get('source')} games" if t["stats"] else "; no CSC stats this season")))
+                                               for t in people_])]
+        rows, edges = [], []
+        for field, label, better in self.COMPARE_METRICS:
+            va = A["stats"].get(field)
+            row = {"stat": label, A["name"]: self._fmt_stat(field, va)}
+            if B:
+                vb = B["stats"].get(field)
+                row[B["name"]] = self._fmt_stat(field, vb)
+                edge = ""
+                if better is not None and va is not None and vb is not None and va == va and vb == vb and va != vb:
+                    w_ = A["name"] if (va > vb) == better else B["name"]
+                    edge = w_
+                    if field in ("rating", "adr", "kast", "kr", "impact", "odr", "utilDmg", "tradesR"):
+                        edges.append(w_)
+                row["edge"] = edge
+            rows.append(row)
+        hh += [("h2", "Season stats (CSC)"), ("table", pd.DataFrame(rows), 30)]
+        if B and edges:
+            c = Counter(edges)
+            lead = c.most_common(1)[0]
+            hh += [("bullets", [([], f"{lead[0]} has the edge in {lead[1]} of the {len(edges)} key stats "
+                                     f"(rating, ADR, KAST, kills, impact, opening duels, utility, trades).", "")])]
+        # Analytikill extended stats (per-map record & rating, weapons, hit spots, utility...)
+        ext_season, ext = self.extended_stats(season)
+        # strengths & weaknesses
+        for t in people_:
+            t["pw"], t["traded"] = None, None
+            if t["in_demos"]:
+                pw_ = self.an.power_positions()
+                t["pw"] = pw_[pw_["player"] == t["name"]] if len(pw_) else pw_
+                st_ = self.an.v_players().tables[0][1]
+                if len(st_) and (st_["player"] == t["name"]).any():
+                    t["traded"] = float(st_[st_["player"] == t["name"]]["traded deaths%"].iloc[0])
+            elif t["name"] in other:
+                t["pw"] = other[t["name"]][1]
+        hh += [("h2", "Strengths & weaknesses")]
+        for t in people_:
+            g_, b_ = self.player_traits(t, S, people, ext, tier="" if not t["profile"] else t["profile"].get("tier", ""))
+            items = [(["+ strength"], txt, ev) for txt, ev in g_] + [(["- weakness"], txt, ev) for txt, ev in b_]
+            hh += [("h3", t["name"]), ("bullets", items or [([], "Nothing stands out either way - close to the middle of his tier.", "")])]
+        if ext:
+            nm = [t["name"] for t in people_ if t["name"].lower() in ext]
+            if nm:
+                summ, per_map = self._ext_tables([t["name"] for t in people_], ext)
+                note = "" if ext_season == season else f" - season {ext_season} (season {season} isn't filled in yet)"
+                hh += [("h2", f"Extended stats (Analytikill{note})")]
+                if len(per_map):
+                    hh += [("h3", "By map: record, rating, average kills-deaths"), ("table", per_map, 12)]
+                if len(summ):
+                    hh += [("h3", "Pistols, aim, weapons, utility"), ("table", summ, 30)]
+                miss = [t["name"] for t in people_ if t["name"].lower() not in ext]
+                if miss:
+                    hh += [("bullets", [([], f"No Analytikill extended stats for {', '.join(miss)} in season {ext_season}.", "")])]
+        # demo detail for whoever is in your demos
+        for t in people_:
+            if t["in_demos"]:
+                src = "your demos"
+                pw = self.an.power_positions()
+                pw = pw[pw["player"] == t["name"]] if len(pw) else pw
+                rl = self.an.roles_by_map()
+                rl = rl[rl["player"] == t["name"]] if len(rl) else rl
+            elif t["name"] in other:
+                tm, pw, rl, nmaps = other[t["name"]]
+                src = f"{tm}'s last {nmaps} map demo(s)"
+            else:
+                if "FREE" in t["profile"].get("type", ""):
+                    hh += [("bullets", [([], f"{t['name']} is a free agent, so there are no league demos to read - "
+                                             "his section uses CSC season stats only.", "")])]
+                continue
+            if len(pw):
+                hh += [("h2", f"{t['name']} - power positions ({src})"),
+                       ("table", pw[["map", "half", "power position", "% of rounds", "K-D there", "next most"]], 20)]
+            if len(rl):
+                hh += [("h2", f"{t['name']} - role by map ({src})"),
+                       ("table", rl[["map", "role", "CT role", "why"]].rename(columns={"why": "assessment"}), 12)]
+        pages = [("compare", [("title", title, sub)] + hh[1:])]
+
+        # ---- page: free agents by role
+        T = self.fa_table(S, people, tier, ref=A["stats"] | {"name": A["name"]} if A["stats"] else None, ext=ext)
+        fa = [("title", f"Free agents - {tier if tier.lower() != 'all' else 'all tiers'}",
+               f"grouped by role, best rating first  |  season {season}")]
+        if not len(T):
+            fa += [("bullets", [([], f"No free agents listed in {tier}.", "")])]
+        else:
+            order = [A["group"]] + [g for g in ("AWPer", "Entry", "Support", "Rifler") if g != A["group"]] + ["no stats"]
+            cols = [c for c in T.columns if c not in ("tier", "role")]
+            for g in order:
+                part = T[T["role"] == g]
+                if not len(part):
+                    continue
+                head = {"AWPer": "AWPers", "Entry": "Entries", "Support": "Supports", "Rifler": "Riflers",
+                        "no stats": "No stats this season"}[g]
+                if g == A["group"]:
+                    head += f" - same role as {A['name']}"
+                fa += [("h2", f"{head} ({len(part)})"), ("table", part[cols], 40)]
+            fa += [("bullets", [([], "Roles for free agents are guessed from CSC season stats: AWPer = 0.22+ AWP kills per "
+                                     "round; Entry = most opening duels per round; Support = most utility damage and "
+                                     "flashes with few opening duels; everyone else Rifler. Stats come from league games "
+                                     "when a player has 40+ rounds there, otherwise from combines / FA games.", "")])]
+        pages.append(("free agents", fa))
+
+        groups = add_index(pages)
+        for i_, (nm, bl) in enumerate(pages):  # the comparison page is "Head to head", not "Summary"
+            for j_, b_ in enumerate(bl):
+                if b_[0] == "title" and b_[1] == "Summary":
+                    bl[j_] = ("title", "Head to head") + tuple(b_[2:])
+        groups = [("Head to head" if g[0] == "Summary" else g[0],) + tuple(g[1:]) for g in groups]
+        for nm, bl in pages:
+            for j_, b_ in enumerate(bl):
+                if b_[0] == "index":
+                    bl[j_] = ("index", groups)
+        out = self.ws.out / "report"
+        out.mkdir(parents=True, exist_ok=True)
+        base = safe_name(f"compare_{A['name']}" + (f"_vs_{B['name']}" if B else ""))
+        team = self.team_name or A["profile"].get("team") or "CSC"
+        if fmt in ("html", "both"):
+            path = out / f"{base}.html"
+            path.write_text(render_report_html(f"{A['name']} comparison", pages, []), encoding="utf-8")
+            good(f"HTML compare report: {path}")
+            open_path(path, self.cfg)
+        if fmt in ("pdf", "both"):
+            path = out / f"{base}.pdf"
+            n = save_report_pdf(pages, path, groups)
+            good(f"PDF compare report ({n} pages): {path.name}")
+            if fmt == "pdf":
+                open_path(path, self.cfg)
+        good(f"Compare report can be found at {out}")
+
+    do_vs = do_compare
+
     def player_report(self, name="", fmt=""):
         n = self._pick_player(name)
         if not n:
             return
         return self._hiding_dropped(self._player_report_impl, n, fmt, keep=n)
+
+    def combine_blocks(self, name, seasons_back=1):
+        """Report blocks: one player's combine and FA-colosseum numbers next to his league numbers (CSC stats)."""
+        try:
+            cur = Csc(self.cfg["CSC_API"]).latest_season()
+        except CscError:
+            return []
+        cols = [("gameCount", "games", "{:.0f}"), ("rounds", "rounds", "{:.0f}"), ("rating", "rating", "{:.2f}"),
+                ("adr", "ADR", "{:.1f}"), ("kast", "KAST", "pct"), ("kr", "kills/rnd", "{:.2f}"), ("hs", "HS%", "pct"),
+                ("odaR", "opening duels/rnd", "{:.2f}"), ("odr", "opening win%", "pct"), ("awpR", "AWP kills/rnd", "{:.2f}"),
+                ("utilDmg", "utility dmg", "{:.1f}")]
+        rows, nums = [], {}
+        for season in range(cur, cur - 1 - seasons_back, -1):
+            for label, types in (("combines", ("Combine",)), ("FA games", ("FAColo",)), ("league", ("Regulation", "Playoff"))):
+                S = self.season_stats(season, types)
+                if not len(S):
+                    continue
+                hit = S[S["name"].str.lower() == name.lower()]
+                if not len(hit):
+                    continue
+                r = hit.iloc[0]
+                row = {"season": f"S{season}", "games from": label}
+                for c, lab, f in cols:
+                    v = r.get(c)
+                    if v is None or v != v:
+                        row[lab] = "-"
+                    elif f == "pct":
+                        row[lab] = f"{100 * v:.0f}%" if v <= 1 else f"{v:.0f}%"
+                    else:
+                        row[lab] = f.format(v)
+                rows.append(row)
+                nums[(season, label)] = r
+        if not any(k[1] in ("combines", "FA games") for k in nums):
+            return [("h2", "Combines"), ("bullets", [([], f"No combine or FA games for {name} in season {cur} or "
+                                                          f"{cur - seasons_back}.", "")])]
+        out = [("h2", "Combines"), ("table", pd.DataFrame(rows), 12)]
+        notes = []
+        for season in range(cur, cur - 1 - seasons_back, -1):
+            c, l_ = nums.get((season, "combines")), nums.get((season, "league"))
+            if c is not None and l_ is not None and c.get("rating") == c.get("rating") and l_.get("rating") == l_.get("rating"):
+                d = l_["rating"] - c["rating"]
+                notes.append(([f"S{season}"], f"Rating {c['rating']:.2f} in combines vs {l_['rating']:.2f} in league games "
+                                              f"({d:+.2f}) - " + ("he's played better in league games than in combines." if d > 0.05
+                                                                  else "he's carried his combine form into the league." if d >= -0.05
+                                                                  else "he's played below his combine level in league games."), ""))
+            elif c is not None and l_ is None:
+                notes.append(([f"S{season}"], f"Combines only so far this season ({c['gameCount']:.0f} games, rating {c['rating']:.2f}).", ""))
+        if notes:
+            out.append(("bullets", notes))
+        return out
 
     def _player_report_impl(self, name="", fmt=""):
         self.use_theme()
@@ -8679,6 +9475,7 @@ class Console(cmd.Cmd):
                 self.cfg.v["SIDE"] = saved_side
                 if rows:
                     first += [("h3", "By side"), ("table", pd.concat(rows), 4)]
+            first += self.combine_blocks(n)
             if len(Pt) > 1 and len(Pt[1][1]):
                 first += [("h2", "Where he plays (mid-round)"), ("table", Pt[1][1][Pt[1][1]["player"] == n], 6)]
             o = a.v_openings()
